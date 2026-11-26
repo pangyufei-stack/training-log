@@ -102,3 +102,39 @@ test('replacing the trainer link cuts off a trainer already signed in', async ()
   await updateDoc(doc(o.db, 'config', 'keys'), { trainerKey: TRAINER });
   await Promise.all([t.close(), t2.close(), o.close()]);
 });
+
+const FRIEND = 'dev-friend-key-000000000000000000000';
+test('friends link: read-only, meal photos only', async () => {
+  const f = await client(FRIEND);
+  assert.equal(f.session, 'ok');
+  assert.equal(await ok(getDoc(doc(f.db, 'meta', 'public'))), true);
+  assert.equal(await ok(getDocs(query(collection(f.db, 'days'), where('date', '>=', '2020-01-01')))), true);
+  assert.equal(await ok(getDocs(collection(f.db, 'activities'))), true);
+  assert.equal(await ok(getDocs(query(collection(f.db, 'photos'), where('kind', '==', 'meal')))), true, 'meal photos');
+  assert.equal(await ok(getDocs(collection(f.db, 'photos'))), false, 'all photos incl. progress');
+  assert.equal(await ok(getDocs(query(collection(f.db, 'photos'), where('kind', '==', 'progress')))), false, 'progress photos');
+  assert.equal(await ok(getDoc(doc(f.db, 'photos', 's1'))), false, 'one progress photo');
+  assert.equal(await ok(getDoc(doc(f.db, 'photoFiles', 's1'))), false, 'progress photo file');
+  assert.equal(await ok(getDoc(doc(f.db, 'photoFiles', 's5'))), true, 'meal photo file');
+  for (const id of ['connections', 'status', 'withingsApp']) assert.equal(await ok(getDoc(doc(f.db, 'private', id))), false, `private/${id}`);
+  assert.equal(await ok(getDoc(doc(f.db, 'config', 'keys'))), false, 'keys');
+  const b = writeBatch(f.db); b.set(doc(f.db, 'photoFiles', 'fp1'), { data: thumb });
+  b.set(doc(f.db, 'photos', 'fp1'), { date: '2026-11-20', kind: 'meal', pose: null, note: '', thumb, uploadedBy: 'trainer', createdAt: serverTimestamp() });
+  assert.equal(await ok(b.commit()), false, 'friend upload');
+  assert.equal(await ok(updateDoc(doc(f.db, 'photos', 's5'), { note: 'x' })), false, 'friend edit');
+  assert.equal(await ok(setDoc(doc(f.db, 'days', '2026-01-02'), { date: '2026-01-02', macros: { kcal: 1, protein: 1, carbs: 1, fat: 1, source: 'manual' } })), false, 'friend macros');
+  await f.close();
+});
+
+test('owner can switch the friends link off and on', async () => {
+  const o = await client(OWNER);
+  const f = await client(FRIEND);
+  await updateDoc(doc(o.db, 'config', 'keys'), { viewerKey: deleteField() });
+  assert.equal(await ok(getDoc(doc(f.db, 'meta', 'public'))), false, 'off: friend cut off');
+  const t = await client(TRAINER);
+  assert.equal(await ok(getDoc(doc(t.db, 'meta', 'public'))), true, 'trainer unaffected');
+  assert.equal(await ok(updateDoc(doc(o.db, 'config', 'keys'), { viewerKey: 'short' })), false, 'weak key refused');
+  await updateDoc(doc(o.db, 'config', 'keys'), { viewerKey: FRIEND });
+  assert.equal(await ok(getDoc(doc(f.db, 'meta', 'public'))), true, 'on again');
+  await Promise.all([o.close(), f.close(), t.close()]);
+});

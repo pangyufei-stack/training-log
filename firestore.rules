@@ -2,7 +2,8 @@ rules_version = '2';
 
 // There is no server: these rules are the only access control.
 //
-// Access works by secret link. config/keys holds two random keys (owner, trainer).
+// Access works by secret link. config/keys holds random keys: owner, trainer, and an optional
+// shared friends key (viewerKey) that can only read, and never sees progress photos.
 // A browser signs in anonymously, then writes the key from its link into
 // sessions/{its uid}; that write is only accepted if the key matches. Every other
 // rule looks the key up again, so replacing the trainer key in config/keys cuts
@@ -16,6 +17,10 @@ service cloud.firestore {
     function isOwner() { return request.auth != null && sessionKey() == keys().ownerKey; }
     function isTrainer() { return request.auth != null && sessionKey() == keys().trainerKey; }
     function isMember() { return isOwner() || isTrainer(); }
+    function viewerKey() { return keys().get('viewerKey', ''); }
+    function isFriend() { return request.auth != null && viewerKey() != '' && sessionKey() == viewerKey(); }
+    function canView() { return isMember() || isFriend(); }
+    function isKey(k) { return k is string && k.size() >= 32; }
     function role() { return isOwner() ? 'owner' : 'trainer'; }
     function onlyChanges(fields) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(fields); }
     function isDate(s) { return s is string && s.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'); }
@@ -24,19 +29,22 @@ service cloud.firestore {
       allow read, delete: if request.auth != null && request.auth.uid == uid;
       allow create, update: if request.auth != null && request.auth.uid == uid
         && request.resource.data.keys().hasOnly(['key'])
-        && request.resource.data.key is string
-        && (request.resource.data.key == keys().ownerKey || request.resource.data.key == keys().trainerKey);
+        && isKey(request.resource.data.key)
+        && (request.resource.data.key == keys().ownerKey || request.resource.data.key == keys().trainerKey
+            || request.resource.data.key == viewerKey());
     }
 
     match /config/keys {
       allow read: if isOwner();
-      // The owner can replace the trainer key. The owner key is changed only by an admin.
-      allow update: if isOwner() && onlyChanges(['trainerKey'])
-        && request.resource.data.trainerKey is string && request.resource.data.trainerKey.size() >= 32;
+      // The owner can replace the trainer key and create, replace or remove the friends key.
+      // The owner key is changed only by an admin.
+      allow update: if isOwner() && onlyChanges(['trainerKey', 'viewerKey'])
+        && isKey(request.resource.data.trainerKey)
+        && (!('viewerKey' in request.resource.data) || isKey(request.resource.data.viewerKey));
     }
 
     match /meta/public {
-      allow read: if isMember();
+      allow read: if canView();
     }
 
     // Written by the sync job; the owner may mark a source as pending after connecting it.
@@ -66,7 +74,7 @@ service cloud.firestore {
         && m.kcal >= 0 && m.kcal <= 20000 && m.protein >= 0 && m.carbs >= 0 && m.fat >= 0;
     }
     match /days/{date} {
-      allow read: if isMember();
+      allow read: if canView();
       // The owner can type in (or clear) a day's macros. Everything else comes from the sync job.
       allow create: if isOwner() && request.resource.data.keys().hasOnly(['date', 'macros'])
         && request.resource.data.date == date && isDate(date) && validMacros(request.resource.data.macros);
@@ -75,7 +83,7 @@ service cloud.firestore {
     }
 
     match /activities/{id} {
-      allow read: if isMember();
+      allow read: if canView();
     }
 
     function validTags(d) {
@@ -87,7 +95,8 @@ service cloud.firestore {
 
     // Photo metadata plus a small preview. The full photo lives in photoFiles/{same id}.
     match /photos/{id} {
-      allow read: if isMember();
+      // Friends only ever get meal photos; their queries must ask for kind == 'meal'.
+      allow read: if isMember() || (isFriend() && resource.data.kind == 'meal');
       allow create: if isMember()
         && request.resource.data.keys().hasOnly(['date', 'kind', 'pose', 'note', 'thumb', 'uploadedBy', 'createdAt'])
         && validTags(request.resource.data)
@@ -100,7 +109,8 @@ service cloud.firestore {
       allow delete: if canEditPhoto(resource.data);
     }
     match /photoFiles/{id} {
-      allow read: if isMember();
+      allow read: if isMember()
+        || (isFriend() && get(/databases/$(db)/documents/photos/$(id)).data.kind == 'meal');
       allow create: if isMember()
         && request.resource.data.keys().hasOnly(['data'])
         && request.resource.data.data is string && request.resource.data.data.size() < 1000000

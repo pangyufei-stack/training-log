@@ -25,7 +25,7 @@ function png(top, bottom, w, hgt) {
   let r = 42;
   const rand = () => ((r = (r * 1664525 + 1013904223) % 4294967296) / 4294967296);
   const end = today();
-  await store.set('config', 'keys', { ownerKey: 'dev-owner-key-0000000000000000000000', trainerKey: 'dev-trainer-key-00000000000000000000' }, { merge: false });
+  await store.set('config', 'keys', { ownerKey: 'dev-owner-key-0000000000000000000000', trainerKey: 'dev-trainer-key-00000000000000000000', viewerKey: 'dev-friend-key-000000000000000000000' }, { merge: false });
   await store.set('meta', 'public', { displayName: 'Sample training log', timezone: 'Asia/Singapore', githubRepo: 'example/training-log', lastSyncAt: Date.now() - 40 * 60000 });
   const kinds = [['Strength', 'strength_training'], ['Easy run', 'running'], ['Intervals', 'running'], ['Bike', 'cycling']];
   const days = [], acts = [];
@@ -55,6 +55,6 @@ function png(top, bottom, w, hgt) {
     mfp: { connected: false, status: 'not_connected', message: '' },
   });
   await store.set('private', 'connections', { garmin: { tokens: { oauth1: { oauth_token: 'secret-token', oauth_token_secret: 's' }, oauth2: { access_token: 'secret' } } } });
-  console.log('Seeded. Owner: #k=dev-owner-key-0000000000000000000000  Trainer: #k=dev-trainer-key-00000000000000000000');
+  console.log('Seeded. Owner: #k=dev-owner-key-0000000000000000000000  Trainer: #k=dev-trainer-key-00000000000000000000  Friend: #k=dev-friend-key-000000000000000000000');
   process.exit(0);
 })();

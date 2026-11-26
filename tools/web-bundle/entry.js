@@ -3,5 +3,5 @@ export { initializeApp } from 'firebase/app';
 export { getAuth, signInAnonymously, connectAuthEmulator } from 'firebase/auth';
 export {
   getFirestore, connectFirestoreEmulator, doc, getDoc, getDocs, setDoc, updateDoc, collection, query, where,
-  orderBy, writeBatch, serverTimestamp, deleteField,
+  orderBy, limit, writeBatch, serverTimestamp, deleteField,
 } from 'firebase/firestore';
