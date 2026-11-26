@@ -74,7 +74,7 @@ secrets are not available on the free plan. Usage here is small, but set a budge
 8. Open `https://YOUR-PROJECT-ID.web.app/#k=YOUR-OWNER-KEY`, go to **Settings**, connect the three
    sources, press **Re-read 90 days**, then copy the **Trainer link** and send it.
 
-Functions run in `us-central1`. To change region, edit `REGION` in `functions/index.js` and the
+Functions run in `asia-southeast1` (Singapore), next to the Firestore database. To change region, edit `REGION` in `functions/index.js` and the
 rewrite in `firebase.json` together.
 
 ## Things to know

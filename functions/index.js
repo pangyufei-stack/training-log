@@ -8,7 +8,7 @@ const WITHINGS_CLIENT_ID = defineSecret('WITHINGS_CLIENT_ID');
 const WITHINGS_CLIENT_SECRET = defineSecret('WITHINGS_CLIENT_SECRET');
 
 // Must match the region in firebase.json's hosting rewrite.
-const REGION = 'us-central1';
+const REGION = 'asia-southeast1';
 const TZ = process.env.APP_TIMEZONE || 'UTC';
 
 exports.api = onRequest(
