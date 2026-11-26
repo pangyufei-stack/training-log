@@ -1,0 +1,8 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.firebase/
+.firebaserc
+*.log
+garmin-tokens.json

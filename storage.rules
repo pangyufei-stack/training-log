@@ -1,0 +1,9 @@
+rules_version = '2';
+// Photos are only ever served through the Cloud Function after the secret link is checked.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
