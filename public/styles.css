@@ -220,3 +220,7 @@ dialog::backdrop { background: rgba(var(--bg-rgb), .85); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-delay: 0s !important; transition-duration: .01ms !important; }
 }
+a { color: var(--accent); }
+a:hover { color: var(--accent-hover); }
+a.btn { text-decoration: none; }
+a.btn.primary, a.btn.primary:hover { color: var(--on-accent); }

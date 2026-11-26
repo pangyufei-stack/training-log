@@ -1,4 +1,10 @@
 // Training log dashboard. Plain ES modules, no build step. Visual rules: /DESIGN.md.
+// There is no server: the page reads and writes Firestore directly, and firestore.rules
+// decide what the owner and trainer links may do.
+import {
+  initializeApp, getAuth, signInAnonymously, connectAuthEmulator, getFirestore, connectFirestoreEmulator,
+  doc, getDoc, getDocs, setDoc, updateDoc, collection, query, where, orderBy, writeBatch, serverTimestamp, deleteField,
+} from './vendor/firebase.js';
 
 // ---------- tiny DOM helpers ----------
 const $app = document.getElementById('app');
@@ -67,9 +73,14 @@ const addDays = (iso, n) => { const d = asDate(iso); d.setUTCDate(d.getUTCDate()
 const avg = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
 const title = (s) => String(s || '').replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase());
 
-// ---------- state + API ----------
-const state = { key: '', me: null, data: null, tab: 'overview', range: 30, photoFilter: 'all' };
+// ---------- state + data ----------
+const state = { key: '', role: null, me: null, data: null, tab: 'overview', range: 30, photoFilter: 'all' };
 const charts = [];
+let db;
+
+const DEFAULT_TZ = 'Asia/Singapore';
+const todayIn = (tz) => new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+const randomKey = () => btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
 function readKey() {
   const fromHash = new URLSearchParams(location.hash.slice(1)).get('k');
@@ -78,20 +89,99 @@ function readKey() {
     return fromHash || localStorage.getItem('tl.key') || '';
   } catch { return fromHash || ''; }
 }
-async function api(path, { method = 'GET', body, raw, type } = {}) {
-  const res = await fetch('/api' + path, {
-    method,
-    headers: { authorization: `Bearer ${state.key}`, ...(raw ? { 'content-type': type } : body ? { 'content-type': 'application/json' } : {}) },
-    body: raw || (body ? JSON.stringify(body) : undefined),
-  });
-  const json = await res.json().catch(() => ({}));
-  if (res.status === 401 && !path.startsWith('/connections')) { gate(json.error); throw new Error(json.error || 'Not allowed'); }
-  if (!res.ok) throw new Error(json.error || `Request failed (${res.status})`);
-  return json;
+
+const LOCAL = ['localhost', '127.0.0.1'].includes(location.hostname);
+async function firebaseConfig() {
+  try {
+    const res = await fetch('/__/firebase/init.json');
+    if (res.ok) return await res.json();
+  } catch { /* fall through */ }
+  if (LOCAL) return { projectId: 'demo-training-log', apiKey: 'demo-key', authDomain: 'localhost' };
+  throw new Error('Firebase settings could not be loaded.');
 }
-const photoUrl = (p) => `/api/photos/${p.id}/file?k=${encodeURIComponent(state.key)}`;
-const isOwner = () => state.me?.role === 'owner';
-const canEdit = (p) => isOwner() || p.uploadedBy === state.me?.role;
+
+/** Signs this browser in and proves the key from the link. Returns 'owner', 'trainer' or null. */
+async function connect() {
+  const app = initializeApp(await firebaseConfig());
+  const auth = getAuth(app);
+  db = getFirestore(app);
+  if (LOCAL) {
+    connectAuthEmulator(auth, 'http://127.0.0.1:9099', { disableWarnings: true });
+    connectFirestoreEmulator(db, '127.0.0.1', 8080);
+  }
+  const { user } = await signInAnonymously(auth);
+  try {
+    await setDoc(doc(db, 'sessions', user.uid), { key: state.key });
+  } catch (e) {
+    if (e.code === 'permission-denied') return null;
+    throw e;
+  }
+  try {
+    const keys = await getDoc(doc(db, 'config', 'keys'));
+    state.trainerKey = keys.data().trainerKey;
+    return 'owner';
+  } catch (e) {
+    if (e.code !== 'permission-denied') throw e;
+    return 'trainer';
+  }
+}
+
+const docData = (snap) => ({ id: snap.id, ...snap.data() });
+const between = (col, from, to) => getDocs(query(collection(db, col), where('date', '>=', from), where('date', '<=', to), orderBy('date')));
+
+async function loadMe() {
+  const meta = (await getDoc(doc(db, 'meta', 'public'))).data() || {};
+  const timezone = meta.timezone || DEFAULT_TZ;
+  state.me = {
+    role: state.role,
+    displayName: meta.displayName || 'Training log',
+    timezone,
+    today: todayIn(timezone),
+    lastSyncAt: meta.lastSyncAt || null,
+    githubRepo: meta.githubRepo || '',
+  };
+  if (state.role === 'owner') {
+    const [status, app] = await Promise.all([getDoc(doc(db, 'private', 'status')), getDoc(doc(db, 'private', 'withingsApp'))]);
+    const st = status.data() || {};
+    state.me.connections = Object.fromEntries(['garmin', 'withings', 'mfp'].map((n) => [n, { connected: false, status: 'not_connected', ...(st[n] || {}) }]));
+    state.me.withingsApp = app.data() || {};
+    state.me.trainerKey = state.trainerKey;
+  }
+}
+
+async function loadData() {
+  const to = state.me.today;
+  const from = addDays(to, -(state.range - 1));
+  const [days, activities, photos] = await Promise.all([
+    between('days', from, to),
+    between('activities', from, to),
+    getDocs(collection(db, 'photos')), // few, and the grid shows them all whatever the chart range
+  ]);
+  state.data = { from, to, days: days.docs.map(docData), activities: activities.docs.map(docData), photos: photos.docs.map(docData) };
+}
+async function refresh() {
+  await loadMe();
+  await loadData();
+  render();
+}
+
+const fullPhotos = new Map();
+/** The full-size photo is a separate document, fetched only when someone opens it. */
+async function fullPhoto(p) {
+  if (!fullPhotos.has(p.id)) {
+    fullPhotos.set(p.id, getDoc(doc(db, 'photoFiles', p.id)).then((s) => s.data()?.data || p.thumb).catch(() => p.thumb));
+  }
+  return fullPhotos.get(p.id);
+}
+function photoImg(p, attrs = {}) {
+  const img = h('img', { src: p.thumb, alt: '', ...attrs });
+  fullPhoto(p).then((src) => { img.src = src; });
+  return img;
+}
+
+const isOwner = () => state.role === 'owner';
+const canEdit = (p) => isOwner() || p.uploadedBy === state.role;
+const friendly = (e) => (e?.code === 'permission-denied' ? 'Not allowed. The link may have been replaced; ask for a new one.' : e?.message || String(e));
 
 function toast(text) {
   document.querySelector('.toast')?.remove();
@@ -106,17 +196,7 @@ function gate(message) {
 }
 async function busy(btn, fn) {
   btn.disabled = true;
-  try { return await fn(); } catch (e) { toast(e.message); } finally { btn.disabled = false; }
-}
-
-async function loadData() {
-  const to = state.me.today;
-  state.data = await api(`/data?from=${addDays(to, -(state.range - 1))}&to=${to}`);
-}
-async function refresh() {
-  state.me = await api('/me');
-  await loadData();
-  render();
+  try { return await fn(); } catch (e) { toast(friendly(e)); } finally { btn.disabled = false; }
 }
 
 // ---------- shell ----------
@@ -340,7 +420,7 @@ function dialog(titleText, body) {
 const kindTag = (p) => [h('span', { class: 'tag' }, p.kind === 'meal' ? 'Meal' : 'Progress'), p.pose ? h('span', { class: 'tag' }, title(p.pose)) : null];
 function thumb(p) {
   return h('button', { class: 'thumb', onclick: () => openPhoto(p), 'aria-label': `${p.kind} photo from ${fmtLong(p.date)}` },
-    h('img', { src: photoUrl(p), loading: 'lazy', alt: '' }), h('span', { class: 'cap' }, kindTag(p)));
+    h('img', { src: p.thumb, loading: 'lazy', alt: '' }), h('span', { class: 'cap' }, kindTag(p)));
 }
 
 function openDay(date) {
@@ -354,12 +434,12 @@ function openDay(date) {
     const f = h('form', { class: 'stack', onsubmit: async (e) => {
       e.preventDefault();
       const v = Object.fromEntries(new FormData(f));
-      await busy(f.querySelector('button'), async () => { await api(`/days/${date}/macros`, { method: 'PUT', body: v }); dlg.close(); await refresh(); toast('Saved'); });
+      await busy(f.querySelector('button'), async () => { await setDoc(doc(db, 'days', date), { date, macros: { source: 'manual', ...Object.fromEntries(['kcal', 'protein', 'carbs', 'fat'].map((k) => [k, Math.round(Number(v[k]) * 10) / 10])) } }, { merge: true }); dlg.close(); await refresh(); toast('Saved'); });
     } },
       h('div', { class: 'row' }, [['kcal', 'Calories'], ['protein', 'Protein g'], ['carbs', 'Carbs g'], ['fat', 'Fat g']].map(([k, l]) =>
         h('label', null, l, h('input', { type: 'number', name: k, min: 0, step: 'any', required: true, value: m?.[k] ?? '' })))),
       h('div', { class: 'row' }, h('button', { class: 'btn primary' }, 'Save by hand'),
-        m?.source === 'manual' ? h('button', { class: 'btn', type: 'button', onclick: async (e) => busy(e.target, async () => { await api(`/days/${date}/macros`, { method: 'DELETE' }); dlg.close(); await refresh(); toast('Cleared; the next sync refills it'); }) }, 'Clear and use MyFitnessPal') : null));
+        m?.source === 'manual' ? h('button', { class: 'btn', type: 'button', onclick: async (e) => busy(e.target, async () => { await updateDoc(doc(db, 'days', date), { macros: deleteField() }); dlg.close(); await refresh(); toast('Cleared; the next sync refills it'); }) }, 'Clear and use MyFitnessPal') : null));
     return f;
   };
   dlg = dialog(fmtLong(date), [
@@ -391,32 +471,37 @@ function openPhoto(p) {
   const form = canEdit(p) ? h('form', { class: 'stack', onsubmit: async (e) => {
     e.preventDefault();
     const v = Object.fromEntries(new FormData(form));
-    await busy(form.querySelector('button'), async () => { await api(`/photos/${p.id}`, { method: 'PATCH', body: v }); dlg.close(); await refresh(); toast('Photo updated'); });
+    await busy(form.querySelector('button'), async () => { await updateDoc(doc(db, 'photos', p.id), { date: v.date, kind: v.kind, pose: v.kind === 'progress' && v.pose ? v.pose : null, note: String(v.note || '').trim().slice(0, 500) }); dlg.close(); await refresh(); toast('Photo updated'); });
   } },
     h('label', null, 'Date taken', h('input', { type: 'date', name: 'date', value: p.date, max: addDays(state.me.today, 1), required: true })),
     tagFields(p),
     h('div', { class: 'row' }, h('button', { class: 'btn primary' }, 'Save changes'),
-      h('button', { class: 'btn danger', type: 'button', onclick: async (e) => { if (!confirm('Delete this photo for everyone? This cannot be undone.')) return; await busy(e.currentTarget, async () => { await api(`/photos/${p.id}`, { method: 'DELETE' }); dlg.close(); await refresh(); toast('Photo deleted'); }); } }, icon('trash'), 'Delete'))) : null;
+      h('button', { class: 'btn danger', type: 'button', onclick: async (e) => { if (!confirm('Delete this photo for everyone? This cannot be undone.')) return; await busy(e.currentTarget, async () => { const b = writeBatch(db); b.delete(doc(db, 'photoFiles', p.id)); b.delete(doc(db, 'photos', p.id)); await b.commit(); dlg.close(); await refresh(); toast('Photo deleted'); }); } }, icon('trash'), 'Delete'))) : null;
   dlg = dialog(fmtLong(p.date), [
-    h('div', { class: 'viewer' }, h('img', { src: photoUrl(p), alt: `${p.kind} photo` })),
+    h('div', { class: 'viewer' }, photoImg(p, { alt: `${p.kind} photo` })),
     h('div', { class: 'row' }, kindTag(p), h('span', { class: 'help' }, `Added by ${p.uploadedBy === 'owner' ? 'the owner' : 'the trainer'}`)),
     p.note ? h('p', null, p.note) : null,
     form ? h('details', null, h('summary', null, 'Change date, type or note'), form) : null,
   ]);
 }
 
-/** Shrinks a photo in the browser so uploads are quick and small; returns a JPEG blob. */
-async function shrink(file) {
-  try {
-    const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
-    const scale = Math.min(1, 1800 / Math.max(bmp.width, bmp.height));
+/** Re-encodes a photo as a JPEG data URL no longer than maxChars, shrinking until it fits. */
+async function encode(bmp, longEdge, maxChars) {
+  for (let edge = longEdge, q = 0.82; edge >= 320; edge = Math.round(edge * 0.85), q = Math.max(0.6, q - 0.05)) {
+    const scale = Math.min(1, edge / Math.max(bmp.width, bmp.height));
     const c = h('canvas', { width: Math.round(bmp.width * scale), height: Math.round(bmp.height * scale) });
     c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
-    const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.86));
-    if (blob) return blob;
-  } catch { /* fall through to the original file */ }
-  if (/^image\/(jpeg|png|webp)$/.test(file.type)) return file;
-  throw new Error(`"${file.name}" is not a photo format this page can read. Try a JPEG.`);
+    const url = c.toDataURL('image/jpeg', q);
+    if (url.length <= maxChars) return url;
+  }
+  throw new Error('This photo could not be made small enough to store.');
+}
+async function prepare(file) {
+  let bmp;
+  try { bmp = await createImageBitmap(file, { imageOrientation: 'from-image' }); } catch {
+    throw new Error(`"${file.name}" is not a photo format this page can read. Try a JPEG.`);
+  }
+  return { full: await encode(bmp, 1600, 950000), thumb: await encode(bmp, 360, 60000) };
 }
 const fileDate = (f) => { const d = new Date(f.lastModified || Date.now()); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
 
@@ -436,16 +521,19 @@ function openUpload(presetDate) {
     await busy(form.querySelector('button.primary'), async () => {
       for (const [i, f] of files.entries()) {
         status.textContent = `Uploading ${i + 1} of ${files.length}…`;
-        const blob = await shrink(f);
-        const q = new URLSearchParams({ date: v[`date-${i}`], kind: v.kind, pose: v.kind === 'progress' ? v.pose : '', note: v.note });
-        await api(`/photos?${q}`, { method: 'POST', raw: blob, type: blob.type });
+        const { full, thumb } = await prepare(f);
+        const ref = doc(collection(db, 'photos'));
+        const b = writeBatch(db);
+        b.set(doc(db, 'photoFiles', ref.id), { data: full });
+        b.set(ref, { date: v[`date-${i}`], kind: v.kind, pose: v.kind === 'progress' && v.pose ? v.pose : null, note: String(v.note || '').trim().slice(0, 500), thumb, uploadedBy: state.role, createdAt: serverTimestamp() });
+        await b.commit();
       }
       dlg.close(); state.tab = 'photos'; await refresh(); toast(`${files.length} photo${files.length > 1 ? 's' : ''} added`);
     });
     status.textContent = '';
   } },
     h('label', null, 'Photos', picker), rows, tagFields(),
-    h('p', { class: 'help' }, 'Each photo is filed under its date. The date is pre-filled from the photo file; change it if it is wrong.'),
+    h('p', { class: 'help' }, 'Each photo is filed under its date. The date is pre-filled from the photo file; change it if it is wrong. Photos are compressed before upload.'),
     status, h('div', { class: 'row' }, h('button', { class: 'btn primary' }, icon('upload'), 'Upload')));
   dlg = dialog('Add photos', form);
 }
@@ -462,7 +550,7 @@ function openCompare() {
     const ps = progress.filter((p) => p.date === date && (!pose.value || p.pose === pose.value));
     return h('div', null, h('div', { class: 'label' }, fmtDay(date, { day: 'numeric', month: 'short', year: 'numeric' })),
       h('p', { class: 'help' }, day?.weightKg != null ? `${num(day.weightKg, 1)} kg` : 'No weigh-in in the loaded range'),
-      ps.length ? ps.map((p) => h('img', { src: photoUrl(p), alt: `${p.pose || 'progress'} photo` })) : h('p', { class: 'help' }, 'No photo with this pose.'));
+      ps.length ? ps.map((p) => photoImg(p, { alt: `${p.pose || 'progress'} photo` })) : h('p', { class: 'help' }, 'No photo with this pose.'));
   };
   const draw = () => out.replaceChildren(col(a.value), col(b.value));
   [a, b, pose].forEach((s) => s.addEventListener('change', draw));
@@ -496,35 +584,98 @@ function pill(c) {
   const [cls, ic, text] = map[c.status] || map.not_connected;
   return h('span', { class: `pill ${cls}` }, icon(ic), text);
 }
+const WITHINGS_AUTHORIZE = 'https://account.withings.com/oauth2_user/authorize2';
+const withingsRedirect = () => `${location.origin}/`;
+
+async function setStatus(name, fields) {
+  await setDoc(doc(db, 'private', 'status'), { [name]: fields }, { merge: true });
+}
+
+async function startWithings(app) {
+  const st = randomKey();
+  sessionStorage.setItem('tl.withingsState', st);
+  const q = new URLSearchParams({ response_type: 'code', client_id: app.clientId, scope: 'user.metrics,user.activity', redirect_uri: withingsRedirect(), state: st });
+  location.href = `${WITHINGS_AUTHORIZE}?${q}`;
+}
+
+/** Back from Withings with a code: swap it for tokens at once (codes expire after 30 seconds). */
+async function finishWithings(code, returnedState) {
+  const expected = sessionStorage.getItem('tl.withingsState');
+  sessionStorage.removeItem('tl.withingsState');
+  if (!expected || expected !== returnedState) throw new Error('Withings sign-in did not match this browser. Try again.');
+  const app = (await getDoc(doc(db, 'private', 'withingsApp'))).data();
+  const res = await fetch('https://wbsapi.withings.net/v2/oauth2', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ action: 'requesttoken', grant_type: 'authorization_code', client_id: app.clientId, client_secret: app.clientSecret, code, redirect_uri: withingsRedirect() }),
+  });
+  const json = await res.json();
+  if (json.status !== 0) throw new Error(`Withings refused the sign-in (${json.status}${json.error ? `: ${json.error}` : ''}).`);
+  const t = json.body;
+  await setDoc(doc(db, 'private', 'connections'), { withings: {
+    accessToken: t.access_token, refreshToken: t.refresh_token, expiresAt: Date.now() + (Number(t.expires_in) || 10800) * 1000, userId: String(t.userid ?? ''),
+  } }, { merge: true });
+  await setStatus('withings', { connected: true, status: 'pending', message: 'Connected. Data appears after the next sync.' });
+}
+
 function viewSettings() {
   const c = state.me.connections;
   const link = `${location.origin}/#k=${state.me.trainerKey}`;
-  const after = async (res) => { state.me.connections = res.connections; await loadData(); render(); const r = res.result; toast(r?.status === 'ok' ? 'Connected and synced' : r?.message || 'Saved'); };
-  const disconnect = (name) => c[name].connected ? h('button', { class: 'btn danger', type: 'button', onclick: async (e) => { if (!confirm(`Disconnect ${SOURCE_NAMES[name]}? Data already collected stays.`)) return; await busy(e.currentTarget, async () => { state.me.connections = (await api(`/connections/${name}`, { method: 'DELETE' })).connections; render(); }); } }, 'Disconnect') : null;
+  const repo = state.me.githubRepo;
+  const actionsUrl = repo ? `https://github.com/${repo}/actions/workflows/sync.yml` : '';
+  const done = async (msg) => { await refresh(); toast(msg); };
+  const disconnect = (name) => c[name].connected ? h('button', { class: 'btn danger', type: 'button', onclick: async (e) => {
+    if (!confirm(`Disconnect ${SOURCE_NAMES[name]}? Data already collected stays.`)) return;
+    await busy(e.currentTarget, async () => {
+      await setDoc(doc(db, 'private', 'connections'), { [name]: deleteField() }, { merge: true });
+      await setStatus(name, { connected: false, status: 'not_connected', message: '' });
+      await done(`${SOURCE_NAMES[name]} disconnected`);
+    });
+  } }, 'Disconnect') : null;
   const card = (name, what, ...body) => h('div', { class: 'card' },
     h('div', { class: 'head' }, h('h3', null, SOURCE_NAMES[name]), pill(c[name])),
     h('p', null, what, c[name].lastOkAt ? ` Last successful sync ${fmtAgo(c[name].lastOkAt)}.` : ''),
     c[name].message ? h('p', { class: 'msg' }, c[name].message) : null, body);
-  const submit = (path, form) => async (e) => { e.preventDefault(); const v = Object.fromEntries(new FormData(form)); await busy(form.querySelector('button'), async () => after(await api(path, { method: 'POST', body: v }))); };
+  const form = (fields, onsubmit) => {
+    const f = h('form', { class: 'stack' }, fields);
+    f.onsubmit = async (e) => { e.preventDefault(); await busy(f.querySelector('button'), () => onsubmit(Object.fromEntries(new FormData(f)))); };
+    return f;
+  };
+  const afterSync = h('p', { class: 'help', style: 'margin-top:10px' }, 'Takes effect at the next sync. ', actionsUrl ? h('a', { href: actionsUrl, target: '_blank', rel: 'noopener' }, 'Run a sync now on GitHub') : null, actionsUrl ? ' to see it sooner.' : '');
 
-  const gForm = h('form', { class: 'stack' });
-  gForm.append(h('div', { class: 'row' }, h('label', null, 'Garmin email', h('input', { type: 'email', name: 'email', autocomplete: 'off', required: true })), h('label', null, 'Garmin password', h('input', { type: 'password', name: 'password', autocomplete: 'off', required: true }))),
-    h('p', { class: 'help' }, 'Used once to sign in. The password is not stored; only the login token Garmin returns is kept.'),
-    h('div', { class: 'row' }, h('button', { class: 'btn primary' }, c.garmin.connected ? 'Sign in again' : 'Sign in to Garmin'), disconnect('garmin')));
-  gForm.onsubmit = submit('/connections/garmin', gForm);
-  const tForm = h('form', { class: 'stack' });
-  tForm.append(h('label', null, 'Text printed by scripts/garmin-login.js', h('textarea', { name: 'tokens', required: true, spellcheck: false })), h('div', { class: 'row' }, h('button', { class: 'btn' }, 'Save Garmin login')));
-  tForm.onsubmit = submit('/connections/garmin', tForm);
+  const gForm = form([
+    h('div', { class: 'row' }, h('label', null, 'Garmin email', h('input', { type: 'email', name: 'email', autocomplete: 'off', required: true })), h('label', null, 'Garmin password', h('input', { type: 'password', name: 'password', autocomplete: 'off', required: true }))),
+    h('p', { class: 'help' }, 'Saved write-only: this page cannot read it back. The next sync signs in once, keeps only the login token Garmin returns, and deletes the password.'),
+    h('div', { class: 'row' }, h('button', { class: 'btn primary' }, c.garmin.connected ? 'Sign in again' : 'Save Garmin sign-in'), disconnect('garmin')),
+  ], async (v) => {
+    await setDoc(doc(db, 'private', 'garminLogin'), { email: v.email.trim(), password: v.password });
+    await setStatus('garmin', { connected: true, status: 'pending', message: 'Sign-in saved. The next sync will use it.' });
+    await done('Saved. It takes effect at the next sync.');
+  });
+  const tForm = form([
+    h('label', null, 'Text printed by scripts/garmin-login.js', h('textarea', { name: 'tokens', required: true, spellcheck: false })),
+    h('div', { class: 'row' }, h('button', { class: 'btn' }, 'Save Garmin login')),
+  ], async (v) => {
+    let t;
+    try { t = JSON.parse(v.tokens); } catch { throw new Error('That is not the text printed by scripts/garmin-login.js.'); }
+    if (!t?.oauth1?.oauth_token || !t?.oauth2?.access_token) throw new Error('Those Garmin tokens are incomplete.');
+    await setDoc(doc(db, 'private', 'connections'), { garmin: { tokens: { oauth1: t.oauth1, oauth2: t.oauth2 } } }, { merge: true });
+    await setStatus('garmin', { connected: true, status: 'pending', message: 'Login saved. Data appears after the next sync.' });
+    await done('Saved');
+  });
 
-  const mForm = h('form', { class: 'stack' });
-  mForm.append(h('label', null, 'MyFitnessPal username', h('input', { type: 'text', name: 'username', autocomplete: 'off', value: c.mfp.username || '' })),
-    h('label', null, `Session cookie${c.mfp.hasCookie ? ' (one is saved; paste a new one to replace it)' : ' (only needed if your diary is not public)'}`, h('textarea', { name: 'cookie', spellcheck: false })),
-    h('p', { class: 'help' }, 'Easiest: in MyFitnessPal go to Settings, Diary Settings, Diary Sharing and choose Public; then only the username is needed. To keep the diary private instead, log in at myfitnesspal.com on a computer, open the browser developer tools, find the cookie named __Secure-next-auth.session-token and paste its value here. It expires from time to time and this page will then ask for a new one.'),
-    h('div', { class: 'row' }, h('button', { class: 'btn primary' }, c.mfp.connected ? 'Save and test' : 'Connect MyFitnessPal'), disconnect('mfp')));
-  mForm.onsubmit = submit('/connections/mfp', mForm);
+  const app = state.me.withingsApp || {};
+  const wForm = form([
+    h('div', { class: 'row' }, h('label', null, 'Withings client ID', h('input', { type: 'text', name: 'clientId', autocomplete: 'off', required: true, value: app.clientId || '' })), h('label', null, 'Withings client secret', h('input', { type: 'password', name: 'clientSecret', autocomplete: 'off', required: true, value: app.clientSecret || '' }))),
+    h('p', { class: 'help' }, 'From your free app at developer.withings.com. Set its callback URL to ', h('b', null, withingsRedirect()), '.'),
+    h('div', { class: 'row' }, h('button', { class: 'btn primary' }, c.withings.connected ? 'Sign in to Withings again' : 'Connect Withings'), disconnect('withings')),
+  ], async (v) => {
+    const next = { clientId: v.clientId.trim(), clientSecret: v.clientSecret.trim() };
+    await setDoc(doc(db, 'private', 'withingsApp'), next);
+    await startWithings(next);
+  });
 
   const linkInput = h('input', { type: 'text', readOnly: true, value: link, 'aria-label': 'Trainer link', onfocus: (e) => e.target.select() });
-  const syncBtn = (days, label, cls = '') => h('button', { class: `btn ${cls}`, onclick: async (e) => busy(e.currentTarget, async () => { const r = await api('/sync', { method: 'POST', body: { days } }); await refresh(); const failed = Object.entries(r.sources).filter(([, s]) => s.status === 'needs_login' || s.status === 'error').map(([n]) => SOURCE_NAMES[n]); toast(failed.length ? `Synced, but ${failed.join(' and ')} failed` : 'Synced'); }) }, cls ? icon('sync') : null, label);
 
   return h('div', { class: 'view' },
     pageHead('Settings', 'Only you see this tab. Your trainer sees everything else.'),
@@ -533,31 +684,45 @@ function viewSettings() {
         h('p', null, 'Anyone with this link can see your data and photos and add photos. Send it only to your trainer. Replacing it switches the old link off immediately.'),
         h('div', { class: 'stack' }, linkInput, h('div', { class: 'row' },
           h('button', { class: 'btn primary', onclick: async () => { try { await navigator.clipboard.writeText(link); toast('Link copied'); } catch { linkInput.focus(); toast('Press Ctrl+C to copy'); } } }, icon('copy'), 'Copy link'),
-          h('button', { class: 'btn danger', onclick: async (e) => { if (!confirm('Replace the trainer link? The current link stops working straight away.')) return; await busy(e.currentTarget, async () => { state.me.trainerKey = (await api('/trainer-link/rotate', { method: 'POST' })).trainerKey; render(); toast('New link created'); }); } }, 'Replace link')))),
+          h('button', { class: 'btn danger', onclick: async (e) => {
+            if (!confirm('Replace the trainer link? The current link stops working straight away.')) return;
+            await busy(e.currentTarget, async () => { const k = randomKey(); await updateDoc(doc(db, 'config', 'keys'), { trainerKey: k }); state.trainerKey = k; await done('New link created'); });
+          } }, 'Replace link')))),
       h('div', { class: 'card' }, h('div', { class: 'head' }, h('h3', null, 'Sync')),
-        h('p', null, `Runs by itself three times a day (${state.me.timezone} time) and re-reads the last 4 days each time. Last run ${fmtAgo(state.me.lastSyncAt)}.`),
-        h('div', { class: 'row', style: 'margin-top:12px' }, syncBtn(4, 'Sync now', 'primary'), syncBtn(30, 'Re-read 30 days'), syncBtn(90, 'Re-read 90 days'))),
+        h('p', null, `Runs on GitHub three times a day, at about 06:20, 14:20 and 22:20 ${state.me.timezone} time, and re-reads the last 4 days each time. GitHub sometimes starts these a little late. Last run ${fmtAgo(state.me.lastSyncAt)}.`),
+        actionsUrl ? h('div', { class: 'row', style: 'margin-top:12px' },
+          h('a', { class: 'btn primary', href: actionsUrl, target: '_blank', rel: 'noopener' }, icon('sync'), 'Run a sync on GitHub')) : null,
+        actionsUrl ? h('p', { class: 'help', style: 'margin-top:8px' }, 'On GitHub, press "Run workflow". To load older history, change "How many recent days" to 90 first.') : null),
       card('garmin', 'Steps and workouts from your Garmin watch.', gForm,
-        h('details', null, h('summary', null, 'Garmin refuses the sign-in?'), h('p', { class: 'help', style: 'margin-top:8px' }, 'Garmin sometimes blocks sign-ins from cloud servers. Run "node scripts/garmin-login.js" on your own computer, then paste what it prints.'), tForm)),
-      card('withings', 'Weight, body fat and sleep, through the official Withings sign-in.',
-        h('div', { class: 'row', style: 'margin-top:12px' }, h('button', { class: 'btn primary', onclick: async (e) => busy(e.currentTarget, async () => { location.href = (await api('/connections/withings/start', { method: 'POST' })).url; }) }, c.withings.connected ? 'Sign in again' : 'Connect Withings'), disconnect('withings'))),
-      card('mfp', 'Calories and macros, read from your MyFitnessPal food diary.', mForm)));
+        h('details', null, h('summary', null, 'Garmin refuses the sign-in?'), h('p', { class: 'help', style: 'margin-top:8px' }, 'Garmin sometimes blocks sign-ins from GitHub\'s servers. Run "node scripts/garmin-login.js" on your own computer, then paste what it prints.'), tForm)),
+      card('withings', 'Weight, body fat and sleep, through the official Withings sign-in.', wForm, c.withings.connected ? afterSync : null),
+      card('mfp', 'Calories and macros.',
+        h('p', { class: 'msg' }, 'Not working yet: MyFitnessPal changed its website and the automatic reading needs updating. Until then, open a day in the Daily log and enter its macros by hand.'))));
 }
 
 // ---------- boot ----------
 (async function boot() {
   state.key = readKey();
-  if (!state.key) return gate();
   const q = new URLSearchParams(location.search);
-  const withings = q.get('withings');
-  if (withings) history.replaceState(null, '', location.pathname + location.hash);
+  const code = q.get('code');
+  const returnedState = q.get('state');
+  if (code || q.get('error')) history.replaceState(null, '', location.pathname + location.hash);
+  if (!state.key) return gate();
   try {
+    state.role = await connect();
+    if (!state.role) return gate('This link is not valid any more. Ask for a new one.');
+    let message = '';
+    if (code && state.role === 'owner') {
+      try { await finishWithings(code, returnedState); message = 'Withings connected. Data appears after the next sync.'; } catch (e) { message = friendly(e); }
+      state.tab = 'settings';
+    } else if (q.get('error')) {
+      message = 'Withings sign-in was cancelled.';
+      state.tab = 'settings';
+    }
     await refresh();
-    if (withings === 'connected' && isOwner()) {
-      state.tab = 'settings'; render(); toast('Withings connected. Reading the last 30 days…');
-      await api('/sync', { method: 'POST', body: { days: 30 } }); await refresh();
-    } else if (withings === 'failed') { state.tab = isOwner() ? 'settings' : state.tab; render(); toast('Withings sign-in did not complete. Try again.'); }
+    if (message) toast(message);
   } catch (e) {
-    if (!document.querySelector('.gate')) gate(`Could not load the dashboard: ${e.message}`);
+    console.error(e);
+    gate(`Could not load the dashboard: ${friendly(e)}`);
   }
 })();

@@ -32,8 +32,8 @@ async function login(email, password) {
   } catch (e) {
     throw new NeedsLogin(
       'Garmin refused the sign-in. Check the email and password. If they are right, Garmin is ' +
-        'probably blocking sign-ins from cloud servers or your account uses two-step verification: ' +
-        'run scripts/garmin-login.js on your own computer and paste the result here instead. (' +
+        'probably blocking sign-ins from GitHub\'s servers: run scripts/garmin-login.js on your own ' +
+        'computer and paste the result under Settings > Garmin instead. (' +
         String(e.message || e).slice(0, 160) + ')'
     );
   }

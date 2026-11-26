@@ -1,0 +1,46 @@
+name: Sync
+
+# 06:20, 14:20 and 22:20 UTC = 14:20, 22:20 and 06:20 Singapore time.
+# GitHub may start scheduled runs some minutes late.
+on:
+  schedule:
+    - cron: '20 6,14,22 * * *'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: How many recent days to re-read
+        required: true
+        default: '4'
+
+permissions:
+  contents: read
+  id-token: write # lets the job sign in to Google without a stored key
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sync/package-lock.json
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: yufei-training-log
+          workload_identity_provider: projects/637819578056/locations/global/workloadIdentityPools/github/providers/training-log
+          service_account: training-log-sync@yufei-training-log.iam.gserviceaccount.com
+      - run: npm ci --no-audit --no-fund
+        working-directory: sync
+      - run: node run.js
+        working-directory: sync
+        env:
+          DAYS: ${{ inputs.days || '4' }}
+          FIREBASE_PROJECT_ID: yufei-training-log
+          APP_TIMEZONE: Asia/Singapore

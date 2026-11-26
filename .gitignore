@@ -6,3 +6,5 @@ node_modules/
 .firebaserc
 *.log
 garmin-tokens.json
+firebase-debug.log
+firestore-debug.log

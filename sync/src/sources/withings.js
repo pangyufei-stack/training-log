@@ -1,34 +1,20 @@
 'use strict';
 /**
  * Withings: weight, body fat and sleep, through the official Withings API (OAuth 2).
- * Needs a free developer app from https://developer.withings.com; its client id and
- * secret are stored as the WITHINGS_CLIENT_ID / WITHINGS_CLIENT_SECRET secrets.
+ * Needs a free developer app from https://developer.withings.com. The owner enters its
+ * client id and secret on the Settings page (stored in private/withingsApp). The first
+ * sign-in happens in the owner's browser; this job only refreshes the tokens.
  */
 const { NeedsLogin } = require('../errors');
 const { dateInTz, unixBounds } = require('../dates');
 
-const AUTHORIZE = 'https://account.withings.com/oauth2_user/authorize2';
 const API = 'https://wbsapi.withings.net';
-const SCOPE = 'user.metrics,user.activity';
 
-function creds() {
-  const id = process.env.WITHINGS_CLIENT_ID;
-  const secret = process.env.WITHINGS_CLIENT_SECRET;
-  if (!id || !secret || id === 'unset' || secret === 'unset') {
-    throw new Error('Withings is not set up yet: the WITHINGS_CLIENT_ID and WITHINGS_CLIENT_SECRET secrets are missing.');
-  }
+function creds(app) {
+  const id = app?.clientId;
+  const secret = app?.clientSecret;
+  if (!id || !secret) throw new NeedsLogin('Withings app id and secret are missing. Enter them under Settings.');
   return { id, secret };
-}
-
-function authorizeUrl(redirectUri, state) {
-  const q = new URLSearchParams({
-    response_type: 'code',
-    client_id: creds().id,
-    scope: SCOPE,
-    redirect_uri: redirectUri,
-    state,
-  });
-  return `${AUTHORIZE}?${q}`;
 }
 
 async function call(path, params, accessToken) {
@@ -60,23 +46,10 @@ function tokenFields(body) {
   };
 }
 
-async function exchangeCode(code, redirectUri) {
-  const { id, secret } = creds();
-  const body = await call('/v2/oauth2', {
-    action: 'requesttoken',
-    grant_type: 'authorization_code',
-    client_id: id,
-    client_secret: secret,
-    code,
-    redirect_uri: redirectUri,
-  });
-  return tokenFields(body);
-}
-
 async function freshAuth(conn) {
   if (!conn.refreshToken) throw new NeedsLogin('Withings is not connected.');
   if (conn.accessToken && conn.expiresAt && conn.expiresAt - Date.now() > 5 * 60 * 1000) return null;
-  const { id, secret } = creds();
+  const { id, secret } = creds(conn.app);
   // Each refresh returns a new refresh token that replaces the old one.
   const body = await call('/v2/oauth2', {
     action: 'requesttoken',
@@ -165,4 +138,4 @@ async function sync(conn, from, to) {
   return { days, activities: [], auth: auth || undefined };
 }
 
-module.exports = { authorizeUrl, exchangeCode, sync, parseWeights, parseSleep };
+module.exports = { sync, parseWeights, parseSleep };

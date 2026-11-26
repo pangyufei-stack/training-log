@@ -2,7 +2,6 @@
 // Checks the parsers against sample responses written from the documented formats.
 // The MyFitnessPal sample is a reconstruction of its printable-diary page, not a
 // capture from the live site, so a pass here does not prove the live scan works.
-process.env.MEMORY_STORE = '1';
 const test = require('node:test');
 const assert = require('node:assert');
 const { parsePrintableDiary, cookieHeader } = require('../src/sources/mfp');
