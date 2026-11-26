@@ -31,23 +31,51 @@ function isConnected(name, c) {
 
 const setStatus = (name, fields) => store.set('private', 'status', { [name]: fields });
 
-/** A password typed into Settings is used for exactly one sign-in attempt, then deleted. */
+const isRateLimit = (e) => /\(429\)|too many requests|rate.?limit/i.test(String(e?.message || e));
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * A password typed into Settings is used to sign in once, then deleted. Exception: if Garmin
+ * only says "too many requests" (it limits sign-ins from data-centre computers like GitHub's),
+ * the saved sign-in is kept and tried again on the next run, because the password itself was fine.
+ * Returns false when Garmin should be skipped this run.
+ */
 async function consumeGarminLogin(conn, now) {
   const login = await store.get('private', 'garminLogin');
   if (!login) return true;
-  await store.del('private', 'garminLogin');
-  if (!login.email || !login.password) return true;
-  try {
-    const tokens = await SOURCES.garmin.login(login.email, login.password);
-    conn.garmin = { tokens };
-    await store.set('private', 'connections', { garmin: { tokens } });
-    console.log('garmin: signed in');
+  if (!login.email || !login.password) {
+    await store.del('private', 'garminLogin');
     return true;
-  } catch (e) {
-    console.error('garmin sign-in failed:', e.message);
-    await setStatus('garmin', { connected: false, status: 'needs_login', message: String(e.message).slice(0, 400), lastSyncAt: now });
-    return false;
   }
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const tokens = await SOURCES.garmin.login(login.email, login.password);
+      conn.garmin = { tokens };
+      await store.set('private', 'connections', { garmin: { tokens } });
+      await store.del('private', 'garminLogin');
+      console.log('garmin: signed in');
+      return true;
+    } catch (e) {
+      if (isRateLimit(e) && attempt === 1) {
+        console.log('garmin: rate limited, retrying in 60 seconds');
+        await pause(60000);
+        continue;
+      }
+      if (isRateLimit(e)) {
+        console.error('garmin: still rate limited; keeping the saved sign-in for the next run');
+        await setStatus('garmin', {
+          connected: true, status: 'pending', lastSyncAt: now,
+          message: 'Garmin accepted the password but is limiting sign-ins from GitHub right now. It will try again at the next sync; nothing to do.',
+        });
+        return false;
+      }
+      console.error('garmin sign-in failed:', e.message);
+      await store.del('private', 'garminLogin');
+      await setStatus('garmin', { connected: false, status: 'needs_login', message: String(e.message).slice(0, 400), lastSyncAt: now });
+      return false;
+    }
+  }
+  return false;
 }
 
 async function runSync({ days = 4, only = NAMES } = {}) {
@@ -65,7 +93,7 @@ async function runSync({ days = 4, only = NAMES } = {}) {
   for (const name of NAMES.filter((n) => only.includes(n))) {
     const c = conn[name];
     if (name === 'garmin' && !garminOk) {
-      summary[name] = { status: 'needs_login' };
+      summary[name] = { status: 'skipped', message: 'see Garmin status in Settings' };
       continue;
     }
     if (!isConnected(name, c)) {
